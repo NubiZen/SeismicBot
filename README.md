@@ -4,11 +4,12 @@ A Node.js tool for deploying ERC-20 compatible tokens on the Seismic devnet and 
 
 ## Features
 
-- One-click token deployment on Seismic devnet
+- One-click token deployment on Seismic
 - Automated token transfers to multiple addresses
 - Real-time transaction status updates
 - Simple interactive prompt-based interface
-
+- multi account using proxy
+- 
 ## Prerequisites
 
 - Node.js (v14 or higher)
@@ -30,13 +31,14 @@ npm install
 
 ## Configuration
 
-Create a `.env` file in the root directory with your private key:
+Create a `accounts.txt` file in the root directory with your private key:
 
 ```
-PRIVATE_KEY=your_private_key_here
+0x
+0x
+0x
 ```
 
-> ⚠️ **SECURITY WARNING**: Never share your private key or commit the .env file to GitHub.
 
 ## Usage
 
@@ -48,7 +50,7 @@ node index.js
 
 The interactive CLI will guide you through:
 
-1. Token creation (name, symbol, total supply)
+1. Token creation random (name, symbol, total 1B)
 2. Token deployment to Seismic devnet
 3. Optional: Automated token transfers to random addresses
 

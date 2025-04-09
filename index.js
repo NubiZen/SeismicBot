@@ -1,12 +1,10 @@
 const { ethers } = require("ethers");
 const fs = require("fs");
 const path = require("path");
-const dotenv = require("dotenv");
 const readline = require("readline");
 const solc = require("solc");
 const crypto = require("crypto");
-
-dotenv.config();
+const HttpsProxyAgent = require("https-proxy-agent");
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -78,47 +76,20 @@ function saveContractToFile(contractSource, filename) {
 
 function compileContract(contractPath, contractName) {
   const contractSource = fs.readFileSync(contractPath, 'utf8');
-
   const input = {
     language: 'Solidity',
-    sources: {
-      [path.basename(contractPath)]: {
-        content: contractSource
-      }
-    },
+    sources: { [path.basename(contractPath)]: { content: contractSource } },
     settings: {
-      outputSelection: {
-        '*': {
-          '*': ['abi', 'evm.bytecode']
-        }
-      },
-      optimizer: {
-        enabled: true,
-        runs: 200
-      }
+      outputSelection: { '*': { '*': ['abi', 'evm.bytecode'] } },
+      optimizer: { enabled: true, runs: 200 }
     }
   };
-
   const output = JSON.parse(solc.compile(JSON.stringify(input)));
-  
-  if (output.errors) {
-    const errors = output.errors.filter(error => error.severity === 'error');
-    if (errors.length > 0) {
-      throw new Error(`Compilation errors: ${JSON.stringify(errors, null, 2)}`);
-    }
+  if (output.errors && output.errors.filter(e => e.severity === 'error').length > 0) {
+    throw new Error(`Compilation errors: ${JSON.stringify(output.errors, null, 2)}`);
   }
-
-  const contractFileName = path.basename(contractPath);
-  const compiledContract = output.contracts[contractFileName][contractName];
-  
-  if (!compiledContract) {
-    throw new Error(`Contract ${contractName} not found in compilation output`);
-  }
-
-  return {
-    abi: compiledContract.abi,
-    bytecode: compiledContract.evm.bytecode.object
-  };
+  const compiledContract = output.contracts[path.basename(contractPath)][contractName];
+  return { abi: compiledContract.abi, bytecode: compiledContract.evm.bytecode.object };
 }
 
 function generateRandomAddress() {
@@ -127,86 +98,149 @@ function generateRandomAddress() {
   return wallet.address;
 }
 
+function loadAccounts() {
+  try {
+    const accounts = fs.readFileSync("accounts.txt", "utf8")
+      .split("\n")
+      .map(line => line.trim())
+      .filter(line => line.startsWith("0x") && line.length === 66);
+    if (accounts.length === 0) {
+      throw new Error("File accounts.txt kosong atau tidak ada kunci privat yang valid");
+    }
+    return accounts;
+  } catch (error) {
+    console.error(`${colors.red}❌ Gagal memuat akun: ${error.message}. Harap siapkan file accounts.txt${colors.reset}`);
+    process.exit(1);
+  }
+}
+
+function loadProxies() {
+  try {
+    const proxies = fs.readFileSync("proxy.txt", "utf8")
+      .split("\n")
+      .map(line => line.trim())
+      .filter(line => line && !line.startsWith("#"));
+    return proxies.length > 0 ? proxies : [];
+  } catch (error) {
+    console.log(`${colors.yellow}⚠ Tidak ada proxy.txt atau kosong, berjalan tanpa proxy${colors.reset}`);
+    return [];
+  }
+}
+
+function generateRandomName() {
+  const prefixes = ["Seismic", "Airdrop", "Crypto", "Luna", "Nova", "Stellar"];
+  const suffixes = ["Coin", "Token", "Cash", "Pay", "Bit", "X"];
+  const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+  const suffix = suffixes[Math.floor(Math.random() * suffixes.length)];
+  return `${prefix}${suffix}`;
+}
+
+function generateRandomSymbol() {
+  const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let symbol = "";
+  for (let i = 0; i < 3; i++) {
+    symbol += letters.charAt(Math.floor(Math.random() * letters.length));
+  }
+  return symbol;
+}
+
 function displaySection(title) {
   console.log("\n" + colors.cyan + colors.bright + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" + colors.reset);
   console.log(colors.cyan + " 🚀 " + title + colors.reset);
   console.log(colors.cyan + colors.bright + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" + colors.reset);
 }
 
-async function deployTokenContract(tokenName, tokenSymbol, totalSupply) {
+async function checkEthBalances(accounts, provider) {
+  console.log(`\n${colors.cyan}🔍 Memeriksa saldo ETH semua wallet:${colors.reset}`);
+  for (let i = 0; i < accounts.length; i++) {
+    const wallet = new ethers.Wallet(accounts[i]);
+    const balance = await provider.getBalance(wallet.address);
+    console.log(`👛 Wallet ${i + 1} (${wallet.address}): ${colors.yellow}${ethers.utils.formatEther(balance)} ETH${colors.reset}`);
+  }
+}
+
+async function checkTokenBalances(deployments, provider) {
+  if (deployments.length === 0) return;
+  console.log(`\n${colors.cyan}🔍 Memeriksa saldo token semua wallet:${colors.reset}`);
+  for (let i = 0; i < deployments.length; i++) {
+    const { contractAddress, abi, tokenName, tokenSymbol, account } = deployments[i];
+    const wallet = new ethers.Wallet(account, provider);
+    const tokenContract = new ethers.Contract(contractAddress, abi, wallet);
+    const balance = await tokenContract.balanceOf(wallet.address);
+    console.log(`👛 Wallet ${i + 1} (${wallet.address}): ${colors.yellow}${ethers.utils.formatEther(balance)} ${tokenSymbol} (${tokenName})${colors.reset}`);
+  }
+}
+
+async function deployTokenContract(tokenName, tokenSymbol, totalSupply, privateKey, proxy = null) {
   try {
-    const privateKey = process.env.PRIVATE_KEY;
-    if (!privateKey) {
-      throw new Error("Private key not found in .env file");
-    }
+    if (!privateKey) throw new Error("Private key tidak ditemukan");
 
     displaySection("DEPLOYING TOKEN CONTRACT");
     console.log(`📝 Token Name: ${colors.yellow}${tokenName}${colors.reset}`);
     console.log(`🔤 Token Symbol: ${colors.yellow}${tokenSymbol}${colors.reset}`);
     console.log(`💰 Total Supply: ${colors.yellow}${totalSupply}${colors.reset}`);
     console.log(`🌐 Network: ${colors.yellow}Seismic devnet (Chain ID: 5124)${colors.reset}`);
+    if (proxy) console.log(`🌐 Proxy: ${colors.yellow}${proxy}${colors.reset}`);
 
-    const provider = new ethers.providers.JsonRpcProvider("https://node-2.seismicdev.net/rpc");
+    const providerConfig = proxy ? {
+      url: "https://node-2.seismicdev.net/rpc",
+      agent: new HttpsProxyAgent(proxy)
+    } : "https://node-2.seismicdev.net/rpc";
+    const provider = new ethers.providers.JsonRpcProvider(providerConfig);
     const wallet = new ethers.Wallet(privateKey, provider);
-    
+
     console.log(`👛 Deployer: ${colors.yellow}${wallet.address}${colors.reset}`);
-    
-    const balance = await wallet.getBalance();
+    const balance = await provider.getBalance(wallet.address);
     console.log(`💎 Wallet Balance: ${colors.yellow}${ethers.utils.formatEther(balance)} ETH${colors.reset}`);
-    
-    if (balance.eq(0)) {
-      throw new Error("Wallet has no ETH for transaction fees. Please fund your account.");
-    }
+
+    if (balance.eq(0)) throw new Error("Dompet tidak memiliki ETH untuk biaya transaksi");
 
     const contractPath = saveContractToFile(tokenContractSource, "SeismicToken.sol");
-    console.log(`📄 Contract saved to: ${colors.yellow}${contractPath}${colors.reset}`);
+    console.log(`📄 Kontrak disimpan ke: ${colors.yellow}${contractPath}${colors.reset}`);
     
     const { abi, bytecode } = compileContract(contractPath, "SeismicToken");
-    console.log(`${colors.green}✅ Contract compiled successfully${colors.reset}`);
+    console.log(`${colors.green}✅ Kontrak berhasil dikompilasi${colors.reset}`);
 
     const factory = new ethers.ContractFactory(abi, "0x" + bytecode, wallet);
     
-    console.log(`⏳ Initiating deployment...`);
-    const contract = await factory.deploy(tokenName, tokenSymbol, totalSupply, {
-      gasLimit: 3000000,
-    });
+    console.log(`⏳ Memulai deployment...`);
+    const contract = await factory.deploy(tokenName, tokenSymbol, totalSupply, { gasLimit: 3000000 });
     
-    console.log(`🔄 Transaction hash: ${colors.yellow}${contract.deployTransaction.hash}${colors.reset}`);
-    console.log(`⏳ Waiting for confirmation...`);
-
+    console.log(`🔄 Hash transaksi: ${colors.yellow}${contract.deployTransaction.hash}${colors.reset}`);
+    console.log(`⏳ Menunggu konfirmasi...`);
     await contract.deployTransaction.wait();
     
-    console.log(`\n${colors.green}✅ Token Contract deployed successfully!${colors.reset}`);
-    console.log(`📍 Contract address: ${colors.yellow}${contract.address}${colors.reset}`);
-    console.log(`🔍 View on explorer: ${colors.yellow}https://explorer-2.seismicdev.net/address/${contract.address}${colors.reset}`);
+    console.log(`\n${colors.green}✅ Kontrak Token berhasil dideploy!${colors.reset}`);
+    console.log(`📍 Alamat kontrak: ${colors.yellow}${contract.address}${colors.reset}`);
+    console.log(`🔍 Lihat di explorer: ${colors.yellow}https://explorer-2.seismicdev.net/address/${contract.address}${colors.reset}`);
     
-    return { contractAddress: contract.address, abi: abi };
+    return { contractAddress: contract.address, abi: abi, tokenName, tokenSymbol };
   } catch (error) {
-    console.error(`${colors.red}❌ Error deploying contract: ${error.message}${colors.reset}`);
+    console.error(`${colors.red}❌ Gagal deploy kontrak: ${error.message}${colors.reset}`);
     throw error;
   }
 }
 
-async function transferTokens(contractAddress, abi, numTransfers, amountPerTransfer) {
+async function transferTokens(contractAddress, abi, numTransfers, amountPerTransfer, privateKey, proxy = null, tokenSymbol) {
   try {
     displaySection("TRANSFERRING TOKENS");
-    console.log(`📊 Number of transfers: ${colors.yellow}${numTransfers}${colors.reset}`);
-    console.log(`💸 Amount per transfer: ${colors.yellow}${amountPerTransfer}${colors.reset}`);
-    console.log(`🎯 Contract address: ${colors.yellow}${contractAddress}${colors.reset}`);
-    
-    const privateKey = process.env.PRIVATE_KEY;
-    if (!privateKey) {
-      throw new Error("Private key not found in .env file");
-    }
+    console.log(`📊 Jumlah transfer: ${colors.yellow}${numTransfers}${colors.reset}`);
+    console.log(`💸 Jumlah per transfer: ${colors.yellow}${amountPerTransfer} ${tokenSymbol}${colors.reset}`);
+    console.log(`🎯 Alamat kontrak: ${colors.yellow}${contractAddress}${colors.reset}`);
+    if (proxy) console.log(`🌐 Proxy: ${colors.yellow}${proxy}${colors.reset}`);
 
-    const provider = new ethers.providers.JsonRpcProvider("https://node-2.seismicdev.net/rpc");
+    const providerConfig = proxy ? {
+      url: "https://node-2.seismicdev.net/rpc",
+      agent: new HttpsProxyAgent(proxy)
+    } : "https://node-2.seismicdev.net/rpc";
+    const provider = new ethers.providers.JsonRpcProvider(providerConfig);
     const wallet = new ethers.Wallet(privateKey, provider);
     const tokenContract = new ethers.Contract(contractAddress, abi, wallet);
     
-    console.log(`\n${colors.cyan}📤 Starting transfers...${colors.reset}`);
+    console.log(`\n${colors.cyan}📤 Memulai transfer...${colors.reset}`);
     
     console.log("\n" + colors.cyan + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" + colors.reset);
-    console.log(`${colors.bright}  #  | Recipient Address                            | Amount         | Status${colors.reset}`);
+    console.log(`${colors.bright}  #  | Alamat Penerima                              | Jumlah         | Status${colors.reset}`);
     console.log(colors.cyan + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" + colors.reset);
     
     for (let i = 0; i < numTransfers; i++) {
@@ -215,107 +249,139 @@ async function transferTokens(contractAddress, abi, numTransfers, amountPerTrans
       
       try {
         const tx = await tokenContract.transfer(recipient, formattedAmount);
-        
         process.stdout.write(`  ${i + 1}`.padEnd(4) + "| " + 
             `${recipient}`.padEnd(45) + "| " + 
-            `${amountPerTransfer}`.padEnd(15) + "| " + 
+            `${amountPerTransfer} ${tokenSymbol}`.padEnd(15) + "| " + 
             `${colors.yellow}Pending...${colors.reset}`);
         
         await tx.wait();
-        
         process.stdout.clearLine ? process.stdout.clearLine() : null;
         process.stdout.cursorTo ? process.stdout.cursorTo(0) : null;
         console.log(`  ${i + 1}`.padEnd(4) + "| " + 
             `${recipient}`.padEnd(45) + "| " + 
-            `${amountPerTransfer}`.padEnd(15) + "| " + 
-            `${colors.green}✅ Success${colors.reset}`);
-        
+            `${amountPerTransfer} ${tokenSymbol}`.padEnd(15) + "| " + 
+            `${colors.green}✅ Sukses${colors.reset}`);
       } catch (error) {
         process.stdout.clearLine ? process.stdout.clearLine() : null;
         process.stdout.cursorTo ? process.stdout.cursorTo(0) : null;
         console.log(`  ${i + 1}`.padEnd(4) + "| " + 
             `${recipient}`.padEnd(45) + "| " + 
-            `${amountPerTransfer}`.padEnd(15) + "| " + 
-            `${colors.red}❌ Failed${colors.reset}`);
+            `${amountPerTransfer} ${tokenSymbol}`.padEnd(15) + "| " + 
+            `${colors.red}❌ Gagal${colors.reset}`);
       }
     }
     
     console.log(colors.cyan + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" + colors.reset);
-    console.log(`\n${colors.green}✅ Transfer operations completed${colors.reset}`);
-    
+    console.log(`\n${colors.green}✅ Operasi transfer selesai${colors.reset}`);
   } catch (error) {
-    console.error(`${colors.red}❌ Error transferring tokens: ${error.message}${colors.reset}`);
+    console.error(`${colors.red}❌ Gagal transfer token: ${error.message}${colors.reset}`);
     throw error;
   }
 }
 
-async function main() {
+function showMenu() {
   console.log("\n" + colors.cyan + colors.bright + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" + colors.reset);
   console.log(colors.cyan + colors.bright + "       SEISMIC TOKEN AUTO BOT - AIRDROP INSIDERS           " + colors.reset);
   console.log(colors.cyan + colors.bright + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" + colors.reset);
   console.log(`${colors.yellow}🌐 Network: Seismic devnet (Chain ID: 5124)${colors.reset}`);
-  
-  try {
-    rl.question(`\n${colors.yellow}📝 Enter token name: ${colors.reset}`, (name) => {
-      rl.question(`${colors.yellow}🔤 Enter token symbol: ${colors.reset}`, (symbol) => {
-        rl.question(`${colors.yellow}💰 Enter total supply: ${colors.reset}`, async (supply) => {
-          if (!name || !symbol || !supply) {
-            console.error(`${colors.red}❌ All fields are required!${colors.reset}`);
-            rl.close();
-            return;
-          }
-          
-          try {
-            const totalSupply = parseInt(supply);
-            if (isNaN(totalSupply) || totalSupply <= 0) {
-              throw new Error("Total supply must be a positive number");
-            }
-            
-            const { contractAddress, abi } = await deployTokenContract(name, symbol, totalSupply);
-            
-            rl.question(`\n${colors.yellow}🔄 Do you want to transfer tokens to random addresses? (y/n): ${colors.reset}`, (transferChoice) => {
-              if (transferChoice.toLowerCase() === 'y') {
-                rl.question(`${colors.yellow}📊 Enter number of transfers to perform: ${colors.reset}`, (numTransfers) => {
-                  rl.question(`${colors.yellow}💸 Enter amount per transfer: ${colors.reset}`, async (amountPerTransfer) => {
-                    try {
-                      const transfers = parseInt(numTransfers);
-                      const amount = parseFloat(amountPerTransfer);
-                      
-                      if (isNaN(transfers) || transfers <= 0) {
-                        throw new Error("Number of transfers must be a positive number");
-                      }
-                      
-                      if (isNaN(amount) || amount <= 0) {
-                        throw new Error("Amount must be a positive number");
-                      }
-                      
-                      await transferTokens(contractAddress, abi, transfers, amount);
-                      
-                      console.log(`\n${colors.green}🎉 All operations completed successfully!${colors.reset}`);
-                    } catch (error) {
-                      console.error(`${colors.red}❌ Error: ${error.message}${colors.reset}`);
-                    } finally {
-                      rl.close();
-                    }
-                  });
-                });
-              } else {
-                console.log(`\n${colors.green}🎉 Token deployment completed successfully!${colors.reset}`);
-                rl.close();
-              }
-            });
-            
-          } catch (error) {
-            console.error(`${colors.red}❌ Error: ${error.message}${colors.reset}`);
-            rl.close();
-          }
-        });
-      });
-    });
-  } catch (error) {
-    console.error(`${colors.red}❌ An error occurred: ${error.message}${colors.reset}`);
-    rl.close();
-  }
+  console.log("\n" + colors.yellow + "MENU PILIHAN:" + colors.reset);
+  console.log("1. Deploy Token Baru (Nama & Simbol Acak per Wallet)");
+  console.log("2. Transfer Token ke Alamat Acak");
+  console.log("3. Keluar");
+  console.log(colors.cyan + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" + colors.reset);
 }
 
-main();
+async function main() {
+  const accounts = loadAccounts();
+  const proxies = loadProxies();
+  const TOTAL_SUPPLY = 100000000; // Total pasokan tetap 100 juta
+  let deployments = []; // Deklarasi di luar askMenu agar bisa diakses di semua opsi
+
+  const provider = new ethers.providers.JsonRpcProvider("https://node-2.seismicdev.net/rpc");
+
+  // Cek saldo ETH semua wallet di awal
+  await checkEthBalances(accounts, provider);
+
+  console.log(`\n${colors.yellow}👥 Jumlah akun yang digunakan: ${accounts.length}${colors.reset}`);
+  console.log(`${colors.yellow}🌐 Jumlah proxy yang tersedia: ${proxies.length}${colors.reset}`);
+
+  async function askMenu() {
+    showMenu();
+    rl.question(`${colors.yellow}Pilih opsi (1-3): ${colors.reset}`, async (choice) => {
+      switch (choice) {
+        case "1":
+          deployments = []; // Reset deployments sebelum deploy baru
+          for (let i = 0; i < accounts.length; i++) {
+            const tokenName = generateRandomName(); // Nama acak per wallet
+            const tokenSymbol = generateRandomSymbol(); // Simbol acak per wallet
+            const proxy = proxies[i] || null;
+            console.log(`\n${colors.cyan}🔄 Memproses akun ${i + 1}/${accounts.length}${colors.reset}`);
+            console.log(`${colors.yellow}📝 Nama token yang dihasilkan: ${tokenName}${colors.reset}`);
+            console.log(`${colors.yellow}🔤 Simbol token yang dihasilkan: ${tokenSymbol}${colors.reset}`);
+            try {
+              const result = await deployTokenContract(tokenName, tokenSymbol, TOTAL_SUPPLY, accounts[i], proxy);
+              deployments.push({ account: accounts[i], ...result });
+            } catch (error) {
+              console.error(`${colors.red}❌ Gagal deploy untuk akun ${i + 1}: ${error.message}${colors.reset}`);
+            }
+          }
+          console.log(`\n${colors.green}🎉 Penyebaran token selesai!${colors.reset}`);
+          await checkTokenBalances(deployments, provider); // Cek saldo token setelah deploy
+          askMenu();
+          break;
+
+        case "2":
+          if (deployments.length === 0) {
+            console.error(`${colors.red}❌ Belum ada token yang dideploy. Deploy dulu di opsi 1!${colors.reset}`);
+            askMenu();
+            return;
+          }
+          await checkTokenBalances(deployments, provider); // Cek saldo token sebelum transfer
+          rl.question(`${colors.yellow}📊 Masukkan jumlah transfer per akun: ${colors.reset}`, (numTransfers) => {
+            rl.question(`${colors.yellow}💸 Masukkan jumlah per transfer: ${colors.reset}`, async (amountPerTransfer) => {
+              const transfers = parseInt(numTransfers);
+              const amount = parseFloat(amountPerTransfer);
+
+              if (isNaN(transfers) || transfers <= 0) {
+                console.error(`${colors.red}❌ Jumlah transfer harus angka positif${colors.reset}`);
+                askMenu();
+                return;
+              }
+              if (isNaN(amount) || amount <= 0) {
+                console.error(`${colors.red}❌ Jumlah harus angka positif${colors.reset}`);
+                askMenu();
+                return;
+              }
+
+              for (let i = 0; i < deployments.length; i++) {
+                const { contractAddress, abi, account, tokenName, tokenSymbol } = deployments[i];
+                const proxy = proxies[i] || null;
+                console.log(`\n${colors.cyan}🔄 Memproses transfer untuk akun ${i + 1}/${deployments.length} (Token: ${tokenName} - ${tokenSymbol})${colors.reset}`);
+                await transferTokens(contractAddress, abi, transfers, amount, account, proxy, tokenSymbol);
+              }
+              console.log(`\n${colors.green}🎉 Semua transfer selesai!${colors.reset}`);
+              await checkTokenBalances(deployments, provider); // Cek saldo token setelah transfer
+              askMenu();
+            });
+          });
+          break;
+
+        case "3":
+          console.log(`${colors.green}👋 Keluar dari program${colors.reset}`);
+          rl.close();
+          break;
+
+        default:
+          console.error(`${colors.red}❌ Pilihan tidak valid. Pilih 1-3!${colors.reset}`);
+          askMenu();
+      }
+    });
+  }
+
+  await askMenu();
+}
+
+main().catch(error => {
+  console.error(`${colors.red}❌ Terjadi error pada program: ${error.message}${colors.reset}`);
+  rl.close();
+});
