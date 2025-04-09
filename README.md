@@ -20,10 +20,10 @@ A Node.js tool for deploying ERC-20 compatible tokens on the Seismic devnet and 
 
 ```bash
 # Clone the repository
-git clone https://github.com/airdropinsiders/Seismic-Auto-Bot.git
+git clone https://github.com/nubizen/SeismicBot.git
 
 # Navigate to the project directory
-cd Seismic-Auto-Bot
+cd SeismicBot
 
 # Install dependencies
 npm install
